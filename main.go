@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -17,6 +18,7 @@ type config struct {
 	mu                 *sync.Mutex
 	concurrencyControl chan struct{}
 	wg                 *sync.WaitGroup
+	maxPages           int
 }
 
 func main() {
@@ -24,14 +26,42 @@ func main() {
 	if len(argsWithoutProg) < 1 {
 		log.Fatal("no website provided")
 	}
-	if len(argsWithoutProg) > 1 {
-		log.Fatal("too many arguments provided")
-	}
+	// if len(argsWithoutProg) > 1 {
+	// 	log.Fatal("too many arguments provided")
+	// }
 	baseURL := argsWithoutProg[0]
+	parsedBaseURL, err := url.Parse(baseURL)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	maxConcurrency, err := strconv.Atoi(argsWithoutProg[1])
+	if err != nil || maxConcurrency <= 0 {
+		log.Fatal("maxConcurrency must be a positive integer")
+	}
+
+	maxPages, err := strconv.Atoi(argsWithoutProg[2])
+	if err != nil || maxPages <= 0 {
+		log.Fatal("maxPages must be a positive integer")
+	}
+
 	fmt.Printf("starting crawl of: %s\n", baseURL)
-	pages := make(map[string]int)
-	crawlPage(baseURL, baseURL, pages)
-	fmt.Println(pages)
+	cfg := config{
+		pages:              make(map[string]PageData),
+		baseURL:            parsedBaseURL,
+		mu:                 &sync.Mutex{},
+		concurrencyControl: make(chan struct{}, maxConcurrency),
+		wg:                 &sync.WaitGroup{},
+		maxPages:           maxPages,
+	}
+	// pages := make(map[string]int)
+	cfg.wg.Add(1)
+	go cfg.crawlPage(baseURL)
+
+	cfg.wg.Wait()
+	if err := writeCSVReport(cfg.pages, "report.csv"); err != nil {
+		log.Fatal(err)
+	}
+	// fmt.Println(pages)
 	// html, err := getHTML(baseURL)
 	// if err != nil {
 	// 	log.Fatal(err.Error())
@@ -73,41 +103,85 @@ func getHTML(rawURL string) (string, error) {
 
 }
 
-func crawlPage(rawBaseURL, rawCurrentURL string, pages map[string]int) {
-	parseBaseURL, err := url.Parse(rawBaseURL)
-	if err != nil {
-		log.Fatal(err.Error())
+// func crawlPage(rawBaseURL, rawCurrentURL string, pages map[string]int) {
+func (cfg *config) crawlPage(rawCurrentURL string) {
+	cfg.mu.Lock()
+	if len(cfg.pages) >= cfg.maxPages {
+		cfg.mu.Unlock()
+		// <-cfg.concurrencyControl
+		cfg.wg.Done()
+		return
 	}
+	cfg.mu.Unlock()
+
+	cfg.concurrencyControl <- struct{}{}
+	defer func() {
+		<-cfg.concurrencyControl
+		cfg.wg.Done()
+	}()
 	parseCurrentURL, err := url.Parse(rawCurrentURL)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	if parseBaseURL.Host != parseCurrentURL.Host {
+	if cfg.baseURL.Host != parseCurrentURL.Host {
 		return
 	}
 	normalizedURL, err := normalizeURL(rawCurrentURL)
 	if err != nil {
 		return
 	}
-	_, ok := pages[normalizedURL]
-	if !ok {
-		pages[normalizedURL] = 1
-	} else {
-		pages[normalizedURL] += 1
+	isFirst := cfg.addPageVisit(normalizedURL)
+	if !isFirst {
 		return
 	}
+
 	fmt.Printf("Crawling: %s\n", rawCurrentURL)
 	html, err := getHTML(rawCurrentURL)
 	if err != nil {
 		return
 	}
-	outgoingLinks, err := getURLsFromHTML(html, parseBaseURL)
+	data := extractPageData(html, rawCurrentURL)
+	cfg.setPageData(normalizedURL, data)
+	// outgoingLinks, err := getURLsFromHTML(html, cfg.baseURL)
+	// if err != nil {
+	// 	return
+	// }
+	for _, v := range cfg.pages[normalizedURL].OutgoingLinks {
+		cfg.wg.Add(1)
+		go cfg.crawlPage(v)
+	}
+}
+
+func (cfg *config) addPageVisit(normalizedURL string) (isFirst bool) {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
+	if _, visited := cfg.pages[normalizedURL]; visited {
+		return false
+	}
+
+	cfg.pages[normalizedURL] = PageData{URL: normalizedURL}
+	return true
+}
+
+// setPageData safely stores the final PageData for a URL.
+func (cfg *config) setPageData(normalizedURL string, data PageData) {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+	cfg.pages[normalizedURL] = data
+}
+
+func configure(rawBaseURL string, maxConcurrency int) (*config, error) {
+	baseURL, err := url.Parse(rawBaseURL)
 	if err != nil {
-		return
+		return nil, fmt.Errorf("couldn't parse base URL: %v", err)
 	}
-	for _, v := range outgoingLinks {
-		if v != rawCurrentURL {
-			crawlPage(rawBaseURL, v, pages)
-		}
-	}
+
+	return &config{
+		pages:              make(map[string]PageData),
+		baseURL:            baseURL,
+		mu:                 &sync.Mutex{},
+		concurrencyControl: make(chan struct{}, maxConcurrency),
+		wg:                 &sync.WaitGroup{},
+	}, nil
 }
